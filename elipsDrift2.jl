@@ -39,6 +39,190 @@ function coortrans(x_in::Float64, y_in::Float64, theta::Float64)
 end
 
 
+
+
+function sparkconfig_new(th_sprk_u, th_sprk_d, N_up, N_dn, theta_sp,
+                     h_sprk, h_drft, a_cap, b_cap, th_cap,
+                     co_angl, x_cent, y_cent, N_trk, trk_max)
+
+    spark_x = Float64[]
+    spark_y = Float64[]
+    spark_size = Float64[]
+
+    # ----------------------------------------------------------
+    # Helper: transform to global frame and store spark
+    # ----------------------------------------------------------
+    function store_spark(xi, yi, a_s)
+        xs, ys = coortrans(xi, yi, -th_cap)
+        push!(spark_x, xs + x_cent)
+        push!(spark_y, ys + y_cent)
+        push!(spark_size, a_s)
+    end
+
+    # Outer and inner ellipse axes of current ring
+    a_out = a_cap
+    a_in  = a_out - 2h_sprk
+    b_out = b_cap
+    b_in  = b_out - b_cap/a_cap * 2h_sprk
+
+    for ring in 1:N_trk
+
+        # Midline of current annular ring
+        a_trk = 0.5*(a_out + a_in)
+        b_trk = 0.5*(b_out + b_in)
+
+        # Offset into flat angle arrays
+        u_off = (ring - 1) * trk_max
+        d_off = (ring - 1) * trk_max
+
+        # ======================================================
+        # Upper half-ring (angles decreasing from π to 0)
+        # ======================================================
+        for jj in 1:N_up[ring]
+
+            ang = th_sprk_u[u_off + jj]
+            a_s = h_sprk
+
+            # Default spark position on ring midline
+            xi = a_trk * cos(ang - th_cap)
+            yi = b_trk * sin(ang - th_cap)
+
+            # Overlap with leading edge (near π)
+            if π - co_angl - ang <= theta_sp[ring] / 2
+                half_gap = 0.5*(π - co_angl - ang) + theta_sp[ring]/4
+                a_s = a_trk * sin(half_gap)
+                trk_a = a_trk + h_sprk - a_s
+                xi = trk_a * cos(π - co_angl - half_gap - th_cap)
+                yi = trk_a * b_trk/a_trk *
+                     sin(π - co_angl - half_gap - th_cap)
+            end
+
+            # Overlap with trailing edge (near 0)
+            if ang <= theta_sp[ring] / 2 - co_angl
+                half_gap = 0.5*(ang + theta_sp[ring]/2 + co_angl)
+                a_s = a_trk * sin(half_gap)
+                trk_a = a_trk + h_sprk - a_s
+                xi = trk_a * cos(half_gap - th_cap - co_angl)
+                yi = trk_a * b_trk/a_trk *
+                     sin(half_gap - th_cap - co_angl)
+            end
+
+            store_spark(xi, yi, a_s)
+        end
+
+        # ======================================================
+        # Lower half-ring (angles increasing from π to 2π)
+        # ======================================================
+        for jj in 1:N_dn[ring]
+
+            ang = th_sprk_d[d_off + jj]
+            a_s = h_sprk
+
+            # Default spark position on ring midline
+            xi = a_trk * cos(ang - th_cap)
+            yi = b_trk * sin(ang - th_cap)
+
+            # Overlap with leading edge (near π)
+            if ang - π + co_angl <= theta_sp[ring] / 2
+                half_gap = 0.5*(ang - π + co_angl) + theta_sp[ring]/4
+                a_s = a_trk * sin(half_gap)
+                trk_a = a_trk + h_sprk - a_s
+                xi = trk_a * cos(π - co_angl + half_gap - th_cap)
+                yi = trk_a * b_trk/a_trk *
+                     sin(π - co_angl + half_gap - th_cap)
+            end
+
+            # Overlap with trailing edge (near 2π)
+            if 2π - ang - co_angl <= theta_sp[ring] / 2
+                half_gap = 0.5*(2π - ang - co_angl) + theta_sp[ring]/4
+                a_s = a_trk * sin(half_gap)
+                trk_a = a_trk + h_sprk - a_s
+                xi = trk_a * cos(2π - half_gap - th_cap - co_angl)
+                yi = trk_a * b_trk/a_trk *
+                     sin(2π - half_gap - th_cap - co_angl)
+            end
+
+            store_spark(xi, yi, a_s)
+        end
+
+        # ======================================================
+        # Gap filling at θ = π junction
+        # ======================================================
+        if th_sprk_d[d_off + 1] - th_sprk_u[u_off + 1] >= theta_sp[ring]
+            gap_half = 0.5*(th_sprk_d[d_off + 1] -
+                            th_sprk_u[u_off + 1])
+            a_s = 0.5*(2a_trk*sin(gap_half) - 2h_sprk)
+            e_trk = a_trk + h_sprk - a_s
+            xi = e_trk * cos(π - th_cap - co_angl)
+            yi = e_trk * b_trk/a_trk *
+                 sin(π - th_cap - co_angl)
+            store_spark(xi, yi, a_s)
+        end
+
+        # ======================================================
+        # Gap filling at θ = 0 / 2π junction
+        # ======================================================
+        last_up = th_sprk_u[u_off + N_up[ring]]
+        last_dn = 2π - th_sprk_d[d_off + N_dn[ring]]
+        gap_sum = last_dn + last_up
+
+        if theta_sp[ring] <= gap_sum <= 2theta_sp[ring]
+            a_s = 0.5*(2a_trk*sin(0.5gap_sum) - 2h_sprk)
+            e_trk = a_trk + h_sprk - a_s
+            xi = e_trk * cos(2π - th_cap - co_angl)
+            yi = e_trk * b_trk/a_trk *
+                 sin(2π - th_cap - co_angl)
+            store_spark(xi, yi, a_s)
+        end
+
+        # Move inward to next ring
+        a_out -= 2h_sprk
+        a_in  -= 2h_sprk
+        b_out -= b_cap/a_cap * 2h_sprk
+        b_in  -= b_cap/a_cap * 2h_sprk
+    end
+
+    # Central core spark
+    push!(spark_x, x_cent)
+    push!(spark_y, y_cent)
+    push!(spark_size,
+          a_cap - N_trk*2h_sprk - 1.5h_drft)
+
+    # ======================================================
+    # Rasterization over regular grid
+    # ======================================================
+    x_pts = Float64[]
+    y_pts = Float64[]
+    n_sparks = length(spark_x)
+
+    x_val = h_drft/2
+    while x_val < 2x_cent
+        y_val = h_drft/2
+        while y_val < 2y_cent
+            for k in 1:n_sparks
+                a_s = spark_size[k]
+                b_s = a_s * b_cap/a_cap
+                if a_s > 0 && b_s > 0
+                    dx = x_val - spark_x[k]
+                    dy = y_val - spark_y[k]
+                    xt, yt = coortrans(dx, dy, th_cap)
+                    if xt^2/a_s^2 + yt^2/b_s^2 < 1
+                        push!(x_pts, x_val)
+                        push!(y_pts, y_val)
+                    end
+                end
+            end
+            y_val += h_drft
+        end
+        x_val += h_drft
+    end
+
+    return x_pts, y_pts
+end
+
+
+
+
 # -----------------------------------------------------------------------------
 # sparkconfig — compute spark positions and rasterize them onto a grid
 #
@@ -279,10 +463,10 @@ function main()
 
     # Hard-coded defaults (equivalent to: julia elipsDrift.jl 200 0 20 1.0 0)
     ntime   = 200      # number of animation frames
-    th_cap  = 0.0      # polar cap tilt angle [rad]  (0 = circular cap in display frame)
-    a_cap   = 20.0     # polar cap major semi-axis [m]
-    b_cap   = 20.0     # polar cap minor semi-axis [m]  (= a_cap → circular)
-    co_angl = 0.0      # co-rotation phase offset [rad]
+    th_cap  = deg2rad(30.0)      # polar cap tilt angle [rad]  (0 = circular cap in display frame)
+    a_cap   = 15.0     # polar cap major semi-axis [m]
+    b_cap   = 5.0     # polar cap minor semi-axis [m]  (= a_cap → circular)
+    co_angl = deg2rad(45.0)      # co-rotation phase offset [rad]
 
     # -------------------------------------------------------------------------
     # Derived / physical parameters
@@ -455,5 +639,171 @@ function main()
         sleep(0.1)
     end
 end
+
+
+
+function main2()
+
+    # -------------------------------------------------------------------------
+    # Input parameters
+    # -------------------------------------------------------------------------
+    ntime   = 200
+    th_cap  = deg2rad(0.0)      # polar cap tilt angle [rad]
+    a_cap   = 20.0              # polar cap major semi-axis [m]
+    b_cap   = 20.0              # polar cap minor semi-axis [m]
+    co_angl = 0.0               # co-rotation phase offset [rad]
+
+    # -------------------------------------------------------------------------
+    # Derived / physical parameters
+    # -------------------------------------------------------------------------
+    h_sprk = 2.6                # spark semi-axis (half-size) [m]
+    h_drft = 0.1                # drift increment per frame [m]
+
+    a_sprk = h_sprk
+    b_sprk = a_sprk * b_cap / a_cap
+
+    x_cent = sqrt((a_cap * cos(th_cap))^2 + (b_cap * sin(th_cap))^2)
+    y_cent = sqrt((a_cap * sin(th_cap))^2 + (b_cap * cos(th_cap))^2)
+
+    N_trk = floor(Int, b_cap / (2 * b_sprk))
+
+    println(stderr, "N_trk = $N_trk   a_cap = $a_cap   b_cap = $b_cap")
+
+    # -------------------------------------------------------------------------
+    # Angular spacing between neighbouring sparks on each ring
+    # -------------------------------------------------------------------------
+    theta_sp = zeros(Float64, N_trk)
+    let a_o = a_cap, a_i = a_o - 2*a_sprk,
+        b_o = b_cap, b_i = b_o - 2*b_sprk
+        for ring in 1:N_trk
+            N_s = floor(Int, 0.75 * (a_o*b_o - a_i*b_i) / (a_sprk*b_sprk))
+            theta_sp[ring] = 2π / N_s
+            a_o -= 2*a_sprk;  a_i -= 2*a_sprk
+            b_o -= 2*b_sprk;  b_i -= 2*b_sprk
+        end
+    end
+
+    # -------------------------------------------------------------------------
+    # Flat 1-D storage for angular positions of sparks on each ring
+    # -------------------------------------------------------------------------
+    trk_max = floor(Int,
+        0.75 * (a_cap*b_cap - (a_cap - 2*a_sprk)*(b_cap - 2*b_sprk)) /
+        (a_sprk * b_sprk) / 2) + 1
+
+    sz        = 2 * trk_max * N_trk + 2
+    th_sprk_u = zeros(Float64, sz)
+    th_sprk_d = zeros(Float64, sz)
+    N_up      = zeros(Int, N_trk)
+    N_dn      = zeros(Int, N_trk)
+
+    # -------------------------------------------------------------------------
+    # Initialise spark angular positions
+    # -------------------------------------------------------------------------
+    for ring in 1:N_trk
+        u_off = (ring - 1) * trk_max
+        d_off = (ring - 1) * trk_max
+
+        th_sprk_u[u_off + 1] = π - theta_sp[ring] / 2 - co_angl
+        N_up[ring] = 1
+        while th_sprk_u[u_off + N_up[ring]] >= theta_sp[ring] - co_angl
+            th_sprk_u[u_off + N_up[ring] + 1] = th_sprk_u[u_off + N_up[ring]] - theta_sp[ring]
+            N_up[ring] += 1
+        end
+
+        th_sprk_d[d_off + 1] = π + theta_sp[ring] / 2 - co_angl
+        N_dn[ring] = 1
+        while th_sprk_d[d_off + N_dn[ring]] <= 2π - theta_sp[ring] - co_angl
+            th_sprk_d[d_off + N_dn[ring] + 1] = th_sprk_d[d_off + N_dn[ring]] + theta_sp[ring]
+            N_dn[ring] += 1
+        end
+    end
+
+    # -------------------------------------------------------------------------
+    # Polar cap boundary ellipse
+    # -------------------------------------------------------------------------
+    ts      = range(0.0, 2π; length = 101)
+    x_elips = [coortrans(a_cap*cos(t), b_cap*sin(t), -th_cap)[1] + x_cent for t in ts]
+    y_elips = [coortrans(a_cap*cos(t), b_cap*sin(t), -th_cap)[2] + y_cent for t in ts]
+
+    # -------------------------------------------------------------------------
+    # Angular drift step per frame
+    # -------------------------------------------------------------------------
+    mean_outer_radius = 0.5 * (a_cap + (a_cap - 2 * a_sprk))
+    del_theta_drift   = h_drft / mean_outer_radius   # arc length → angle [rad/frame]
+
+    # =========================================================================
+    # Main loop — compute spark positions and sizes for every frame.
+    # Results are stored in pre-allocated vectors of vectors:
+    #   all_x[t], all_y[t]  — spark centre coordinates at frame t
+    #   all_ax[t], all_bx[t] — per-spark semi-axes (a, b) at frame t
+    # Semi-axes are uniform within a frame (scale with cap ellipticity),
+    # but stored per-spark for forward compatibility with ring-dependent sizing.
+    # =========================================================================
+    all_x  = Vector{Vector{Float64}}(undef, ntime)
+    all_y  = Vector{Vector{Float64}}(undef, ntime)
+    all_ax = Vector{Vector{Float64}}(undef, ntime)   # major semi-axis of each spark
+    all_bx = Vector{Vector{Float64}}(undef, ntime)   # minor semi-axis of each spark
+
+    for step in 1:ntime
+
+        x_pts, y_pts = sparkconfig(th_sprk_u, th_sprk_d, N_up, N_dn, theta_sp,
+                                    h_sprk, h_drft, a_cap, b_cap, th_cap,
+                                    co_angl, x_cent, y_cent, N_trk, trk_max)
+
+        n_sparks = length(x_pts)
+
+        all_x[step]  = x_pts
+        all_y[step]  = y_pts
+        all_ax[step] = fill(a_sprk, n_sparks)
+        all_bx[step] = fill(b_sprk, n_sparks)
+
+        # ---------------------------------------------------------------------
+        # Advance spark angles by one drift step and rebuild the spark lists.
+        # Upper track drifts clockwise (angle decreases).
+        # Lower track drifts anti-clockwise (angle increases).
+        # When the lead spark passes the boundary it wraps by +/- theta_sp.
+        # ---------------------------------------------------------------------
+        for ring in 1:N_trk
+            u_off = (ring - 1) * trk_max
+            d_off = (ring - 1) * trk_max
+
+            th_sprk_u[u_off + 1] -= del_theta_drift
+            if th_sprk_u[u_off + 1] < π - theta_sp[ring] - co_angl
+                th_sprk_u[u_off + 1] += theta_sp[ring]
+            end
+            N_up[ring] = 1
+            while th_sprk_u[u_off + N_up[ring]] >= theta_sp[ring] - co_angl
+                th_sprk_u[u_off + N_up[ring] + 1] = th_sprk_u[u_off + N_up[ring]] - theta_sp[ring]
+                N_up[ring] += 1
+            end
+
+            th_sprk_d[d_off + 1] += del_theta_drift
+            if th_sprk_d[d_off + 1] > π + theta_sp[ring] - co_angl
+                th_sprk_d[d_off + 1] -= theta_sp[ring]
+            end
+            N_dn[ring] = 1
+            while th_sprk_d[d_off + N_dn[ring]] <= 2π - theta_sp[ring] - co_angl
+                th_sprk_d[d_off + N_dn[ring] + 1] = th_sprk_d[d_off + N_dn[ring]] + theta_sp[ring]
+                N_dn[ring] += 1
+            end
+        end
+    end
+
+    println("Computation complete. Frames stored: $ntime")
+
+    return (
+        x_elips  = x_elips,    # cap boundary — x coordinates
+        y_elips  = y_elips,    # cap boundary — y coordinates
+        all_x    = all_x,      # spark x positions per frame
+        all_y    = all_y,      # spark y positions per frame
+        all_ax   = all_ax,     # spark major semi-axis per frame
+        all_bx   = all_bx,     # spark minor semi-axis per frame
+        a_sprk   = a_sprk,
+        b_sprk   = b_sprk,
+        x_cent   = x_cent,
+        y_cent   = y_cent,
+    )
+end
+
 
 main()
