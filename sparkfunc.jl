@@ -1,3 +1,5 @@
+using Plots
+
 # =============================================================================
 # sparkfunc.jl
 #
@@ -246,7 +248,8 @@ function compute_spark_configuration(
         cap_centre_x::Float64,
         cap_centre_y::Float64,
         number_of_rings::Int,
-        track_stride::Int)
+        track_stride::Int;
+        core_semiaxis_scale::Float64 = 1.0)
 
     spark_x        = Float64[]
     spark_y        = Float64[]
@@ -441,7 +444,7 @@ function compute_spark_configuration(
     # Central (core) spark that fills the innermost region of the cap.
     # Its semi-axis is whatever space remains after all rings are laid down.
     # ------------------------------------------------------------------
-    core_semiaxis = cap_major_semiaxis - number_of_rings * spark_diameter - 1.5 * drift_step
+    core_semiaxis = (cap_major_semiaxis - number_of_rings * spark_diameter - 1.5 * drift_step) * core_semiaxis_scale
     push!(spark_x,        cap_centre_x)
     push!(spark_y,        cap_centre_y)
     push!(spark_semiaxis, core_semiaxis)
@@ -669,3 +672,613 @@ function compute_spark_amplitude(
 
     return total_amplitude
 end
+
+
+# =============================================================================
+# Example: generate a pulse stack by drifting sparks across a scan line
+# =============================================================================
+
+"""
+    generate(;
+        number_of_time_steps, cap_major_semiaxis, cap_minor_semiaxis,
+        cap_tilt_angle, corotation_angle,
+        drift_period_in_pulse_periods, scan_resolution
+    ) -> (pulse_stack, scan_x_values, cap_centre_x, cap_centre_y)
+
+Demonstrate the full signal-generation pipeline:
+
+  1. Build the spark configuration on a tilted elliptical polar cap.
+  2. At each time step scan a horizontal line through the cap centre,
+     evaluating `compute_spark_amplitude` at every scan point.
+  3. Advance the spark pattern by one drift step and repeat.
+
+The result is a 2D array `pulse_stack[step, bin]` — a simulated single-pulse
+stack showing the drifting sub-pulse pattern.
+
+# Keyword arguments
+- `number_of_time_steps`            : how many drift steps to simulate (default 50)
+- `cap_major_semiaxis`              : polar cap major semi-axis, metres  (default 20.0)
+- `cap_minor_semiaxis`              : polar cap minor semi-axis, metres  (default 10.0)
+- `cap_tilt_angle`                  : tilt of the cap ellipse, radians  (default 30°)
+- `corotation_angle`                : phase offset of the drift pattern (default 0.0)
+- `drift_period_in_pulse_periods`   : P3 — how many pulse periods it takes for a spark
+                                      to drift by one angular spacing (default 10.0)
+- `scan_resolution`                 : number of bins along the line-of-sight scan (default 200)
+
+# Returns
+- `pulse_stack`   : matrix [step × bin] of Gaussian amplitudes
+- `scan_x_values` : x-coordinates of the scan bins
+- `cap_centre_x`  : x-coordinate of the cap centre in the display frame
+- `cap_centre_y`  : y-coordinate of the cap centre in the display frame
+
+# Quick start
+```julia
+include("sparkfunc.jl")
+pulse_stack, scan_x, cx, cy = generate()
+println("Pulse stack size: ", size(pulse_stack))   # (50, 200)
+println("Peak amplitude:  ", maximum(pulse_stack))
+```
+"""
+function generate(;
+        number_of_time_steps::Int            = 50,
+        cap_major_semiaxis::Float64          = 20.0,
+        cap_minor_semiaxis::Float64          = 10.0,
+        cap_tilt_angle::Float64              = deg2rad(30.0),
+        corotation_angle::Float64            = 0.0,
+        drift_period_in_pulse_periods::Float64 = 10.0,
+        scan_resolution::Int                 = 200,
+        spark_diameter_factor::Float64       = 2.7,
+        core_semiaxis_scale::Float64         = 1.0)
+
+    # -------------------------------------------------------------------------
+    # Spark size and drift step (heuristic from PCdrift.c)
+    # spark_diameter ≈ cap / spark_diameter_factor  (default 2.7 ≈ 2–3 rings).
+    # Larger factor → smaller ring sparks; smaller factor → larger.
+    # core_semiaxis_scale multiplies the central spark size (default 1.0).
+    # -------------------------------------------------------------------------
+    spark_diameter       = cap_major_semiaxis / spark_diameter_factor
+    drift_step           = spark_diameter / 25.0
+    spark_semiaxis_major = spark_diameter / 2.0
+    spark_semiaxis_minor = spark_semiaxis_major * cap_minor_semiaxis / cap_major_semiaxis
+
+    ellipticity = cap_minor_semiaxis / cap_major_semiaxis
+
+    # -------------------------------------------------------------------------
+    # Centre of the cap ellipse in the display (rotated) frame.
+    # When the ellipse is tilted by cap_tilt_angle, its bounding-box half-widths
+    # become the projections of both semi-axes onto each axis.
+    # -------------------------------------------------------------------------
+    cap_centre_x = sqrt((cap_major_semiaxis * cos(cap_tilt_angle))^2 +
+                        (cap_minor_semiaxis * sin(cap_tilt_angle))^2)
+    cap_centre_y = sqrt((cap_major_semiaxis * sin(cap_tilt_angle))^2 +
+                        (cap_minor_semiaxis * cos(cap_tilt_angle))^2)
+
+    # -------------------------------------------------------------------------
+    # Number of concentric spark rings that fit inside the cap.
+    # Each ring occupies a radial width of one spark_diameter.
+    # -------------------------------------------------------------------------
+    number_of_rings = floor(Int, cap_minor_semiaxis / spark_diameter)
+
+    println("Cap  a=$(cap_major_semiaxis) m  b=$(cap_minor_semiaxis) m  " *
+            "tilt=$(round(rad2deg(cap_tilt_angle), digits=1))°")
+    println("Sparks: diameter=$(round(spark_diameter, digits=2)) m  " *
+            "rings=$(number_of_rings)")
+
+    # -------------------------------------------------------------------------
+    # Angular spacing between neighbouring sparks on each ring.
+    # The number of sparks is estimated from ring area / spark area
+    # with a 0.75 packing factor (0.75 ≈ π/4, hexagonal-ish packing).
+    # -------------------------------------------------------------------------
+    angular_spacing_per_ring = zeros(Float64, number_of_rings)
+
+    let outer_major = cap_major_semiaxis,
+        inner_major = cap_major_semiaxis - spark_diameter,
+        outer_minor = cap_minor_semiaxis,
+        inner_minor = cap_minor_semiaxis - ellipticity * spark_diameter
+
+        for ring in 1:number_of_rings
+            ring_area  = outer_major * outer_minor - inner_major * inner_minor
+            spark_area = spark_semiaxis_major * spark_semiaxis_minor
+            sparks_in_ring = floor(Int, 0.75 * ring_area / spark_area)
+
+            angular_spacing_per_ring[ring] = 2π / sparks_in_ring
+
+            outer_major -= spark_diameter;  inner_major -= spark_diameter
+            outer_minor -= ellipticity * spark_diameter
+            inner_minor -= ellipticity * spark_diameter
+        end
+    end
+
+    # -------------------------------------------------------------------------
+    # Maximum sparks per half-ring — used as the stride in the flat arrays.
+    # -------------------------------------------------------------------------
+    outermost_ring_area = cap_major_semiaxis * cap_minor_semiaxis -
+                          (cap_major_semiaxis - spark_diameter) *
+                          (cap_minor_semiaxis - ellipticity * spark_diameter)
+    track_stride = floor(Int,
+        0.75 * outermost_ring_area / (spark_semiaxis_major * spark_semiaxis_minor) / 2
+    ) + 1
+
+    # -------------------------------------------------------------------------
+    # Flat 1D arrays for spark angular positions.
+    # Ring r (1-based) occupies indices (r-1)*track_stride+1 .. (r-1)*track_stride+track_stride.
+    # -------------------------------------------------------------------------
+    array_size            = 2 * track_stride * number_of_rings + 2
+    upper_track_angles    = zeros(Float64, array_size)
+    lower_track_angles    = zeros(Float64, array_size)
+    sparks_on_upper_track = zeros(Int, number_of_rings)
+    sparks_on_lower_track = zeros(Int, number_of_rings)
+
+    # -------------------------------------------------------------------------
+    # Initialise spark angular positions.
+    # Upper track: first spark just inside the leading edge (angle < π).
+    # Lower track: first spark just past the leading edge (angle > π).
+    # The remaining sparks on each half-ring are spaced by angular_spacing.
+    # -------------------------------------------------------------------------
+    for ring in 1:number_of_rings
+        offset = (ring - 1) * track_stride
+
+        upper_track_angles[offset + 1] =
+            π - angular_spacing_per_ring[ring] / 2 - corotation_angle
+        sparks_on_upper_track[ring] = 1
+        while upper_track_angles[offset + sparks_on_upper_track[ring]] >=
+              angular_spacing_per_ring[ring] - corotation_angle
+            upper_track_angles[offset + sparks_on_upper_track[ring] + 1] =
+                upper_track_angles[offset + sparks_on_upper_track[ring]] -
+                angular_spacing_per_ring[ring]
+            sparks_on_upper_track[ring] += 1
+        end
+
+        lower_track_angles[offset + 1] =
+            π + angular_spacing_per_ring[ring] / 2 - corotation_angle
+        sparks_on_lower_track[ring] = 1
+        while lower_track_angles[offset + sparks_on_lower_track[ring]] <=
+              2π - angular_spacing_per_ring[ring] - corotation_angle
+            lower_track_angles[offset + sparks_on_lower_track[ring] + 1] =
+                lower_track_angles[offset + sparks_on_lower_track[ring]] +
+                angular_spacing_per_ring[ring]
+            sparks_on_lower_track[ring] += 1
+        end
+    end
+
+    # -------------------------------------------------------------------------
+    # Line-of-sight scan: a horizontal line at constant y = cap_centre_y,
+    # sweeping from x = 0 to x = 2*cap_centre_x (the full cap width).
+    # This mimics the receiver beam crossing the rotating polar cap.
+    # -------------------------------------------------------------------------
+    scan_x_values = collect(range(0.0, 2 * cap_centre_x; length = scan_resolution))
+    scan_y_value  = cap_centre_y
+
+    # -------------------------------------------------------------------------
+    # Time-evolution loop: compute the spark layout, sample the scan line,
+    # then advance all sparks by one drift step.
+    # -------------------------------------------------------------------------
+    pulse_stack = zeros(Float64, number_of_time_steps, scan_resolution)
+
+    for step in 1:number_of_time_steps
+
+        # --- Compute spark centre positions and semi-axes for this step ---
+        spark_x_positions, spark_y_positions, spark_semaxes, _ =
+            compute_spark_configuration(
+                upper_track_angles, lower_track_angles,
+                sparks_on_upper_track, sparks_on_lower_track,
+                angular_spacing_per_ring,
+                spark_diameter, drift_step,
+                cap_major_semiaxis, cap_minor_semiaxis,
+                cap_tilt_angle, corotation_angle,
+                cap_centre_x, cap_centre_y,
+                number_of_rings, track_stride;
+                core_semiaxis_scale = core_semiaxis_scale
+            )
+
+        # --- Sample the signal amplitude along the horizontal scan line ---
+        for bin in 1:scan_resolution
+            pulse_stack[step, bin] = compute_spark_amplitude(
+                spark_x_positions, spark_y_positions, spark_semaxes,
+                cap_major_semiaxis, cap_minor_semiaxis, cap_tilt_angle,
+                scan_x_values[bin], scan_y_value
+            )
+        end
+
+        # --- Advance each ring by one drift step ---
+        # The angular step equals one angular spacing divided by P3,
+        # so a spark completes a full circuit in P3 pulse periods.
+        for ring in 1:number_of_rings
+            offset      = (ring - 1) * track_stride
+            drift_angle = angular_spacing_per_ring[ring] / drift_period_in_pulse_periods
+
+            # Upper track drifts clockwise: angle decreases.
+            upper_track_angles[offset + 1] -= drift_angle
+            if upper_track_angles[offset + 1] <
+               π - angular_spacing_per_ring[ring] - corotation_angle
+                upper_track_angles[offset + 1] += angular_spacing_per_ring[ring]
+            end
+            sparks_on_upper_track[ring] = 1
+            while upper_track_angles[offset + sparks_on_upper_track[ring]] >=
+                  angular_spacing_per_ring[ring] - corotation_angle
+                upper_track_angles[offset + sparks_on_upper_track[ring] + 1] =
+                    upper_track_angles[offset + sparks_on_upper_track[ring]] -
+                    angular_spacing_per_ring[ring]
+                sparks_on_upper_track[ring] += 1
+            end
+
+            # Lower track drifts anti-clockwise: angle increases.
+            lower_track_angles[offset + 1] += drift_angle
+            if lower_track_angles[offset + 1] >
+               π + angular_spacing_per_ring[ring] - corotation_angle
+                lower_track_angles[offset + 1] -= angular_spacing_per_ring[ring]
+            end
+            sparks_on_lower_track[ring] = 1
+            while lower_track_angles[offset + sparks_on_lower_track[ring]] <=
+                  2π - angular_spacing_per_ring[ring] - corotation_angle
+                lower_track_angles[offset + sparks_on_lower_track[ring] + 1] =
+                    lower_track_angles[offset + sparks_on_lower_track[ring]] +
+                    angular_spacing_per_ring[ring]
+                sparks_on_lower_track[ring] += 1
+            end
+        end
+    end
+
+    println("Generated pulse stack: $(number_of_time_steps) steps × $(scan_resolution) bins")
+    println("Peak amplitude: $(round(maximum(pulse_stack), digits=4))")
+
+    return pulse_stack, scan_x_values, cap_centre_x, cap_centre_y
+end
+
+
+# =============================================================================
+# Plotting helpers
+# (requires Plots.jl: ]add Plots)
+# =============================================================================
+
+"""
+    plot_pulse_stack(pulse_stack; title, filename)
+
+Display the 2D pulse stack as a heatmap (pulse number vs phase bin).
+Saves to `filename` (PNG) if provided.
+"""
+function plot_pulse_stack(pulse_stack::Matrix{Float64};
+                          title::String    = "Drifting sub-pulses",
+                          filename::Union{String,Nothing} = nothing)
+    n_steps, n_bins = size(pulse_stack)
+    p = heatmap(
+        1:n_bins, 1:n_steps, pulse_stack;
+        xlabel = "Phase bin",
+        ylabel = "Pulse number",
+        title  = title,
+        color  = :inferno,
+        aspect_ratio = :auto,
+    )
+    filename !== nothing && savefig(p, filename)
+    return p
+end
+
+
+"""
+    plot_cap_snapshot(spark_x, spark_y, spark_semiaxis,
+                      cap_major_semiaxis, cap_minor_semiaxis, cap_tilt_angle,
+                      cap_centre_x, cap_centre_y;
+                      scan_y, filename)
+
+Draw each spark as an ellipse on the polar-cap plane.
+The open-field-line boundary ellipse and the horizontal scan line are also shown.
+Saves to `filename` (PNG) if provided.
+"""
+function plot_cap_snapshot(
+        spark_x::Vector{Float64},
+        spark_y::Vector{Float64},
+        spark_semiaxis::Vector{Float64},
+        cap_major_semiaxis::Float64,
+        cap_minor_semiaxis::Float64,
+        cap_tilt_angle::Float64,
+        cap_centre_x::Float64,
+        cap_centre_y::Float64;
+        scan_y::Union{Float64,Nothing}          = nothing,
+        filename::Union{String,Nothing}          = nothing)
+
+    ellipticity = cap_minor_semiaxis / cap_major_semiaxis
+    θ_vals      = range(0, 2π; length = 200)
+
+    # Helper: trace an ellipse using the same convention as compute_spark_configuration.
+    # Points are first placed in the cap-tilted local frame, then rotated by +tilt
+    # (= rotate_coordinates_2d(..., -tilt)) and shifted to the given centre.
+    function ellipse_points(a, b, cx, cy)
+        lx = @. a * cos(θ_vals - cap_tilt_angle)
+        ly = @. b * sin(θ_vals - cap_tilt_angle)
+        rx = @. lx * cos(cap_tilt_angle) - ly * sin(cap_tilt_angle) + cx
+        ry = @. lx * sin(cap_tilt_angle) + ly * cos(cap_tilt_angle) + cy
+        return rx, ry
+    end
+
+    # --- polar cap boundary ---
+    cap_bx, cap_by = ellipse_points(cap_major_semiaxis, cap_minor_semiaxis,
+                                    cap_centre_x, cap_centre_y)
+
+    p = plot(cap_bx, cap_by;
+             label = "cap boundary", lw = 2, lc = :black,
+             aspect_ratio = :equal,
+             xlabel = "x (m)", ylabel = "y (m)",
+             title  = "Polar cap snapshot")
+
+    # --- individual sparks ---
+    for k in eachindex(spark_x)
+        a  = spark_semiaxis[k]
+        b  = a * ellipticity
+        rx, ry = ellipse_points(a, b, spark_x[k], spark_y[k])
+        plot!(p, rx, ry; label = false, lw = 1, lc = :steelblue)
+    end
+    scatter!(p, spark_x, spark_y; label = "spark centres",
+             ms = 3, mc = :red, msw = 0)
+
+    # --- optional scan line ---
+    if scan_y !== nothing
+        x_lo = minimum(cap_bx) - 2.0
+        x_hi = maximum(cap_bx) + 2.0
+        plot!(p, [x_lo, x_hi], [scan_y, scan_y];
+              label = "scan line", lc = :orange, ls = :dash, lw = 1.5)
+    end
+
+    filename !== nothing && savefig(p, filename)
+    return p
+end
+
+
+"""
+    animate_cap(; fps, filename, kwargs...)
+
+Animate the polar-cap spark configuration over all drift steps.
+Each frame shows the spark ellipses and the scan line.
+Saves to `filename` (GIF, default "cap_animation.gif").
+Accepts the same keyword arguments as `generate`.
+"""
+function animate_cap(;
+        fps::Int                         = 10,
+        filename::String                 = "cap_animation.gif",
+        number_of_time_steps::Int        = 50,
+        cap_major_semiaxis::Float64      = 20.0,
+        cap_minor_semiaxis::Float64      = 10.0,
+        cap_tilt_angle::Float64          = deg2rad(30.0),
+        corotation_angle::Float64        = 0.0,
+        drift_period_in_pulse_periods::Float64 = 10.0,
+        spark_diameter_factor::Float64   = 2.7,
+        core_semiaxis_scale::Float64     = 1.0)
+
+    # --- geometry setup (mirrors generate()) ---
+    spark_diameter  = cap_major_semiaxis / spark_diameter_factor
+    drift_step      = spark_diameter / 25.0
+    ellipticity     = cap_minor_semiaxis / cap_major_semiaxis
+    spark_sa_maj    = spark_diameter / 2.0
+    spark_sa_min    = spark_sa_maj * ellipticity
+
+    cap_centre_x = sqrt((cap_major_semiaxis * cos(cap_tilt_angle))^2 +
+                        (cap_minor_semiaxis * sin(cap_tilt_angle))^2)
+    cap_centre_y = sqrt((cap_major_semiaxis * sin(cap_tilt_angle))^2 +
+                        (cap_minor_semiaxis * cos(cap_tilt_angle))^2)
+
+    number_of_rings = floor(Int, cap_minor_semiaxis / spark_diameter)
+
+    angular_spacing_per_ring = zeros(Float64, number_of_rings)
+    let om = cap_major_semiaxis, im = cap_major_semiaxis - spark_diameter,
+        on = cap_minor_semiaxis, inn = cap_minor_semiaxis - ellipticity * spark_diameter
+        for r in 1:number_of_rings
+            ra = om * on - im * inn
+            sa = spark_sa_maj * spark_sa_min
+            angular_spacing_per_ring[r] = 2π / floor(Int, 0.75 * ra / sa)
+            om -= spark_diameter; im -= spark_diameter
+            on -= ellipticity * spark_diameter; inn -= ellipticity * spark_diameter
+        end
+    end
+
+    ring_area_0  = cap_major_semiaxis * cap_minor_semiaxis -
+                   (cap_major_semiaxis - spark_diameter) *
+                   (cap_minor_semiaxis - ellipticity * spark_diameter)
+    track_stride = floor(Int, 0.75 * ring_area_0 / (spark_sa_maj * spark_sa_min) / 2) + 1
+
+    arr    = 2 * track_stride * number_of_rings + 2
+    up_ang = zeros(Float64, arr);  lo_ang = zeros(Float64, arr)
+    up_cnt = zeros(Int, number_of_rings); lo_cnt = zeros(Int, number_of_rings)
+
+    for r in 1:number_of_rings
+        off = (r - 1) * track_stride
+        up_ang[off + 1] = π - angular_spacing_per_ring[r] / 2 - corotation_angle
+        up_cnt[r] = 1
+        while up_ang[off + up_cnt[r]] >= angular_spacing_per_ring[r] - corotation_angle
+            up_ang[off + up_cnt[r] + 1] = up_ang[off + up_cnt[r]] - angular_spacing_per_ring[r]
+            up_cnt[r] += 1
+        end
+        lo_ang[off + 1] = π + angular_spacing_per_ring[r] / 2 - corotation_angle
+        lo_cnt[r] = 1
+        while lo_ang[off + lo_cnt[r]] <= 2π - angular_spacing_per_ring[r] - corotation_angle
+            lo_ang[off + lo_cnt[r] + 1] = lo_ang[off + lo_cnt[r]] + angular_spacing_per_ring[r]
+            lo_cnt[r] += 1
+        end
+    end
+
+    # --- pre-compute cap boundary (static across frames) ---
+    θ_vals = range(0, 2π; length = 200)
+    function ellipse_xy(a, b, cx, cy)
+        lx = @. a * cos(θ_vals - cap_tilt_angle)
+        ly = @. b * sin(θ_vals - cap_tilt_angle)
+        @. lx * cos(cap_tilt_angle) - ly * sin(cap_tilt_angle) + cx,
+           lx * sin(cap_tilt_angle) + ly * cos(cap_tilt_angle) + cy
+    end
+    cap_bx, cap_by = ellipse_xy(cap_major_semiaxis, cap_minor_semiaxis,
+                                 cap_centre_x, cap_centre_y)
+    x_lo = minimum(cap_bx) - 2.0;  x_hi = maximum(cap_bx) + 2.0
+    x_lim = (x_lo - 1, x_hi + 1)
+    y_lim = (minimum(cap_by) - 2, maximum(cap_by) + 2)
+
+    # --- build animation ---
+    anim = @animate for step in 1:number_of_time_steps
+        sx, sy, ssa, _ = compute_spark_configuration(
+            up_ang, lo_ang, up_cnt, lo_cnt, angular_spacing_per_ring,
+            spark_diameter, drift_step,
+            cap_major_semiaxis, cap_minor_semiaxis,
+            cap_tilt_angle, corotation_angle,
+            cap_centre_x, cap_centre_y,
+            number_of_rings, track_stride;
+            core_semiaxis_scale = core_semiaxis_scale)
+
+        p = plot(cap_bx, cap_by;
+                 label = false, lw = 2, lc = :black,
+                 aspect_ratio = :equal,
+                 xlims = x_lim, ylims = y_lim,
+                 xlabel = "x (m)", ylabel = "y (m)",
+                 title  = "Step $step / $number_of_time_steps")
+
+        for k in eachindex(sx)
+            ex, ey = ellipse_xy(ssa[k], ssa[k] * ellipticity, sx[k], sy[k])
+            plot!(p, ex, ey; label = false, lw = 1, lc = :steelblue)
+        end
+        scatter!(p, sx, sy; label = false, ms = 3, mc = :red, msw = 0)
+        plot!(p, [x_lo, x_hi], [cap_centre_y, cap_centre_y];
+              label = false, lc = :orange, ls = :dash, lw = 1.5)
+
+        # advance sparks
+        for r in 1:number_of_rings
+            off         = (r - 1) * track_stride
+            drift_angle = angular_spacing_per_ring[r] / drift_period_in_pulse_periods
+            up_ang[off + 1] -= drift_angle
+            if up_ang[off + 1] < π - angular_spacing_per_ring[r] - corotation_angle
+                up_ang[off + 1] += angular_spacing_per_ring[r]
+            end
+            up_cnt[r] = 1
+            while up_ang[off + up_cnt[r]] >= angular_spacing_per_ring[r] - corotation_angle
+                up_ang[off + up_cnt[r] + 1] = up_ang[off + up_cnt[r]] - angular_spacing_per_ring[r]
+                up_cnt[r] += 1
+            end
+            lo_ang[off + 1] += drift_angle
+            if lo_ang[off + 1] > π + angular_spacing_per_ring[r] - corotation_angle
+                lo_ang[off + 1] -= angular_spacing_per_ring[r]
+            end
+            lo_cnt[r] = 1
+            while lo_ang[off + lo_cnt[r]] <= 2π - angular_spacing_per_ring[r] - corotation_angle
+                lo_ang[off + lo_cnt[r] + 1] = lo_ang[off + lo_cnt[r]] + angular_spacing_per_ring[r]
+                lo_cnt[r] += 1
+            end
+        end
+    end
+
+    gif(anim, filename; fps = fps)
+    println("Saved $filename  ($number_of_time_steps frames @ $(fps) fps)")
+    return anim
+end
+
+
+"""
+    plot_all(; kwargs...)
+
+Convenience wrapper: run `generate`, plot the pulse stack and the first-step
+cap snapshot side by side, and save both to PNG files.
+
+Accepts the same keyword arguments as `generate`.
+"""
+function plot_all(; kwargs...)
+    kw = merge((
+        number_of_time_steps          = 50,
+        cap_major_semiaxis            = 20.0,
+        cap_minor_semiaxis            = 10.0,
+        cap_tilt_angle                = deg2rad(30.0),
+        corotation_angle              = 0.0,
+        drift_period_in_pulse_periods = 10.0,
+        scan_resolution               = 200,
+        spark_diameter_factor         = 2.7,
+        core_semiaxis_scale           = 1.0,
+    ), kwargs)
+
+    pulse_stack, scan_x, cx, cy = generate(; kw...)
+
+    p1 = plot_pulse_stack(pulse_stack;
+                          title    = "Drifting sub-pulses (P3=$(kw.drift_period_in_pulse_periods))",
+                          filename = "pulse_stack.png")
+
+    # Reconstruct first-step spark layout for the cap snapshot.
+    spark_diameter = kw.cap_major_semiaxis / kw.spark_diameter_factor
+    drift_step     = spark_diameter / 25.0
+    ellipticity    = kw.cap_minor_semiaxis / kw.cap_major_semiaxis
+    n_rings        = floor(Int, kw.cap_minor_semiaxis / spark_diameter)
+    spark_sa_maj   = spark_diameter / 2.0
+    spark_sa_min   = spark_sa_maj * ellipticity
+
+    ring_area_0  = kw.cap_major_semiaxis * kw.cap_minor_semiaxis -
+                   (kw.cap_major_semiaxis - spark_diameter) *
+                   (kw.cap_minor_semiaxis - ellipticity * spark_diameter)
+    track_stride = floor(Int, 0.75 * ring_area_0 / (spark_sa_maj * spark_sa_min) / 2) + 1
+
+    angular_spacing = zeros(Float64, n_rings)
+    let om = kw.cap_major_semiaxis, im = kw.cap_major_semiaxis - spark_diameter,
+        on = kw.cap_minor_semiaxis, inn = kw.cap_minor_semiaxis - ellipticity * spark_diameter
+        for r in 1:n_rings
+            ra     = om * on - im * inn
+            sa     = spark_sa_maj * spark_sa_min
+            angular_spacing[r] = 2π / floor(Int, 0.75 * ra / sa)
+            om -= spark_diameter; im -= spark_diameter
+            on -= ellipticity * spark_diameter; inn -= ellipticity * spark_diameter
+        end
+    end
+
+    arr      = 2 * track_stride * n_rings + 2
+    up_ang   = zeros(Float64, arr); lo_ang = zeros(Float64, arr)
+    up_cnt   = zeros(Int, n_rings); lo_cnt = zeros(Int, n_rings)
+    corot    = kw.corotation_angle
+
+    for r in 1:n_rings
+        off = (r - 1) * track_stride
+        up_ang[off + 1] = π - angular_spacing[r] / 2 - corot
+        up_cnt[r] = 1
+        while up_ang[off + up_cnt[r]] >= angular_spacing[r] - corot
+            up_ang[off + up_cnt[r] + 1] = up_ang[off + up_cnt[r]] - angular_spacing[r]
+            up_cnt[r] += 1
+        end
+        lo_ang[off + 1] = π + angular_spacing[r] / 2 - corot
+        lo_cnt[r] = 1
+        while lo_ang[off + lo_cnt[r]] <= 2π - angular_spacing[r] - corot
+            lo_ang[off + lo_cnt[r] + 1] = lo_ang[off + lo_cnt[r]] + angular_spacing[r]
+            lo_cnt[r] += 1
+        end
+    end
+
+    sx, sy, ssa, _ = compute_spark_configuration(
+        up_ang, lo_ang, up_cnt, lo_cnt, angular_spacing,
+        spark_diameter, drift_step,
+        kw.cap_major_semiaxis, kw.cap_minor_semiaxis,
+        kw.cap_tilt_angle, corot, cx, cy, n_rings, track_stride;
+        core_semiaxis_scale = kw.core_semiaxis_scale)
+
+    p2 = plot_cap_snapshot(sx, sy, ssa,
+                           kw.cap_major_semiaxis, kw.cap_minor_semiaxis,
+                           kw.cap_tilt_angle, cx, cy;
+                           scan_y   = cy,
+                           filename = "cap_snapshot.png")
+
+    display(plot(p2, p1; layout = (1, 2), size = (1100, 480)))
+
+    animate_cap(;
+        number_of_time_steps          = kw.number_of_time_steps,
+        cap_major_semiaxis            = kw.cap_major_semiaxis,
+        cap_minor_semiaxis            = kw.cap_minor_semiaxis,
+        cap_tilt_angle                = kw.cap_tilt_angle,
+        corotation_angle              = kw.corotation_angle,
+        drift_period_in_pulse_periods = kw.drift_period_in_pulse_periods,
+        spark_diameter_factor         = kw.spark_diameter_factor,
+        core_semiaxis_scale           = kw.core_semiaxis_scale)
+
+    println("Saved pulse_stack.png, cap_snapshot.png, cap_animation.gif")
+    return pulse_stack, scan_x, cx, cy
+end
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+pulse_stack, scan_x, cap_centre_x, cap_centre_y = plot_all(
+    number_of_time_steps            = 50,
+    cap_major_semiaxis              = 20.0,
+    cap_minor_semiaxis              = 10.0,
+    cap_tilt_angle                  = deg2rad(30.0),
+    corotation_angle                = 0.0,
+    drift_period_in_pulse_periods   = 10.0,
+    scan_resolution                 = 200,
+)
+
